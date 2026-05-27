@@ -1,113 +1,215 @@
 clear; clc; close all;
 
 %% ========================================================================
-%                 UKF SOBRE GEMELO DIGITAL
+%      COULOMB COUNTING vs UKF + CC
+%      ECM THEVENIN 1RC - VALIDACION EXPERIMENTAL
 % ========================================================================
 
 %% ========================================================================
-% CARGAR DATOS DEL GEMELO DIGITAL
+% LOAD DATASET
 %% ========================================================================
 
-load('DigitalTwin_Data.mat');
+fileName = ...
+'AUTO_SAVE_2026-05-19_120247.mat';
+
+if exist(fileName,'file')
+
+    load(fileName);
+
+else
+
+    error('Dataset file not found.');
+
+end
 
 %% ========================================================================
-% VARIABLES
+% EXTRACT DATA
 %% ========================================================================
 
-t_sec = t(:);
-
-V_true = Vt(:);
-
-I_true = I(:);
-
-SOC_real = SoC(:);
+data = logSesion;
 
 %% ========================================================================
-% AÑADIR RUIDO SINTÉTICO
-%
-% Simula sensores reales
+% TIME VECTOR
 %% ========================================================================
 
-rng(1);
+t_raw = data(:,1);
 
-sigma_V = 0.01;      % V
-sigma_I = 0.001;      % A
+if max(t_raw) > 1e5
 
-V_meas = V_true + sigma_V*randn(length(V_true),1);
+    t_sec = (t_raw - t_raw(1))*24*3600;
 
-I_meas = I_true + sigma_I*randn(length(I_true),1);
+else
 
-%% ========================================================================
-% BATERÍA
-%% ========================================================================
+    t_sec = t_raw - t_raw(1);
 
-Cn  = 5.2;
-eta = 1;
-
-Qn = Cn*3600;
-
-%% ========================================================================
-% MODELO ECM
-%% ========================================================================
-
-Rint = 0.20523032;
-R0   = 0.55510210;
-C0   = 5380.22;
-
-%% ========================================================================
-% TIEMPO
-%% ========================================================================
+end
 
 Ts = mean(diff(t_sec));
 
+fprintf('Sampling time Ts = %.4f s\n', Ts);
+
 %% ========================================================================
-% DINÁMICA RC
+% EXPERIMENTAL SIGNALS
 %% ========================================================================
 
-alpha_rc = exp(-Ts/(R0*C0));
+V_exp = data(:,2);
 
-beta_rc = 0.5*R0*(1-alpha_rc);
+I_raw = data(:,3);
+
+N = length(I_raw);
+
+%% ========================================================================
+% CURRENT CORRECTION
+%% ========================================================================
+
+current_offset = 0.02;
+
+% Positive current during discharge
+I_corr = -(I_raw + current_offset);
+
+% Deadzone
+I_corr(abs(I_corr) < 0.08) = 0;
+
+fprintf('\n=================================================\n');
+fprintf('CURRENT INFORMATION\n');
+fprintf('=================================================\n');
+
+fprintf('Raw current mean       = %.6f A\n', mean(I_raw));
+
+fprintf('Corrected current mean = %.6f A\n', mean(I_corr));
+
+%% ========================================================================
+% BATTERY PARAMETERS
+%% ========================================================================
+
+Cn  = 5.2;
+
+eta = 1;
+
+Qn = Cn * 3600;
+
+%% ========================================================================
+% SOC REFERENCE (GROUND TRUTH)
+%% ========================================================================
+
+SOC_ref_full = zeros(N,1);
+
+SOC_ref_full(1) = 1.0;
+
+for k = 2:N
+
+    SOC_ref_full(k) = SOC_ref_full(k-1) ...
+                    - (eta * Ts / Qn) * I_corr(k);
+
+    SOC_ref_full(k) = max(0.01,min(0.99,SOC_ref_full(k)));
+
+end
 
 %% ========================================================================
 % COULOMB COUNTING
 %% ========================================================================
 
-SOC_cc = zeros(length(I_meas),1);
+SOC_cc = zeros(N,1);
 
-SOC_cc(1) = 0.80;
+SOC_cc(1) = 1.0;
 
-for k = 2:length(I_meas)
+for k = 2:N
 
     SOC_cc(k) = SOC_cc(k-1) ...
-              - (eta*Ts/Qn)*I_meas(k);
+              - (eta * Ts / Qn) * I_corr(k);
 
-    SOC_cc(k) = max(0,min(1,SOC_cc(k)));
+    SOC_cc(k) = max(0.01,min(0.99,SOC_cc(k)));
 
 end
 
 %% ========================================================================
-% UKF
+% DETECTION OF REST PERIODS
 %% ========================================================================
 
-L = 2;
+rest_threshold = 0.05;
+
+min_rest_time = 60;
+
+min_rest_samples = round(min_rest_time/Ts);
+
+rest_logic = abs(I_corr) < rest_threshold;
+
+SOC_ref = nan(N,1);
+
+rest_points = [];
+
+k = 1;
+
+while k < N
+
+    if rest_logic(k)
+
+        start_idx = k;
+
+        while k < N && rest_logic(k)
+
+            k = k + 1;
+
+        end
+
+        end_idx = k - 1;
+
+        duration = end_idx - start_idx + 1;
+
+        if duration >= min_rest_samples
+
+            ref_idx = end_idx;
+
+            rest_points = [rest_points; ref_idx];
+
+            SOC_ref(ref_idx) = SOC_ref_full(ref_idx);
+
+        end
+
+    end
+
+    k = k + 1;
+
+end
+
+fprintf('\n=================================================\n');
+fprintf('REST PERIODS DETECTED\n');
+fprintf('=================================================\n');
+
+fprintf('Number of reference points = %d\n', length(rest_points));
 
 %% ========================================================================
-% PARÁMETROS UKF
+% ECM PARAMETERS
 %% ========================================================================
+
+Rint = 0.50523032;
+
+R0   = 0.55510210;
+
+C0   = 5380.22;
+
+%% ========================================================================
+% UKF CONFIGURATION
+%% ========================================================================
+
+L = 1;
 
 alpha_ukf = 1e-3;
-beta_ukf  = 2;
+
+beta_ukf = 2;
+
 kappa_ukf = 0;
 
-lambda = alpha_ukf^2*(L+kappa_ukf)-L;
+lambda = alpha_ukf^2 * (L + kappa_ukf) - L;
 
-gamma = sqrt(L+lambda);
+gamma = sqrt(L + lambda);
 
 %% ========================================================================
-% PESOS
+% UKF WEIGHTS
 %% ========================================================================
 
 Wm = zeros(2*L+1,1);
+
 Wc = zeros(2*L+1,1);
 
 Wm(1) = lambda/(L+lambda);
@@ -123,31 +225,37 @@ for i = 2:2*L+1
 end
 
 %% ========================================================================
-% RUIDOS
+% NOISE MATRICES
 %% ========================================================================
 
-Q_ukf = diag([1e-10 1e-6]);
+Q_ukf = 1e-8;
 
-R_ukf = 0.08^2;
+R_ukf = 0.15^2;
 
 %% ========================================================================
-% INICIALIZACIÓN
+% INITIALIZATION
 %% ========================================================================
-
-N = length(t_sec);
 
 x_est = zeros(L,N);
 
-P = diag([1e-4 1e-4]);
+P = 1e-4;
 
-x_est(:,1) = [0.90; 0];
+x_est(:,1) = SOC_cc(1);
 
 SOC_ukf = zeros(N,1);
 
-SOC_ukf(1) = x_est(1,1);
+SOC_ukf(1) = x_est(:,1);
 
 %% ========================================================================
-% LOOP UKF
+% ESTIMATED VOLTAGE
+%% ========================================================================
+
+V_est = zeros(N,1);
+
+V_est(1) = V_exp(1);
+
+%% ========================================================================
+% UKF LOOP
 %% ========================================================================
 
 for k = 2:N
@@ -156,7 +264,7 @@ for k = 2:N
     % SIGMA POINTS
     %% ================================================================
 
-    S = chol(P,'lower');
+    S = sqrt(P);
 
     Xsigma = zeros(L,2*L+1);
 
@@ -164,14 +272,14 @@ for k = 2:N
 
     for i = 1:L
 
-        Xsigma(:,i+1)   = x_est(:,k-1) + gamma*S(:,i);
+        Xsigma(:,i+1) = x_est(:,k-1) + gamma*S;
 
-        Xsigma(:,i+1+L) = x_est(:,k-1) - gamma*S(:,i);
+        Xsigma(:,i+1+L) = x_est(:,k-1) - gamma*S;
 
     end
 
     %% ================================================================
-    % MODELO PROCESO
+    % PROCESS MODEL
     %% ================================================================
 
     Xsigma_pred = zeros(L,2*L+1);
@@ -180,29 +288,20 @@ for k = 2:N
 
         SOC_i = Xsigma(1,i);
 
-        Vrc_i = Xsigma(2,i);
-
-        %% SOC
-
         SOC_pred = SOC_i ...
-                 - (eta*Ts/Qn)*I_meas(k);
+                 - (eta * Ts / Qn) * I_corr(k);
 
-        SOC_pred = max(0,min(1,SOC_pred));
+        SOC_pred = max(0.01,min(0.99,SOC_pred));
 
-        %% RC
-
-        Vrc_pred = alpha_rc*Vrc_i ...
-                 + beta_rc*I_meas(k);
-
-        Xsigma_pred(:,i) = [SOC_pred; Vrc_pred];
+        Xsigma_pred(:,i) = SOC_pred;
 
     end
 
     %% ================================================================
-    % MEDIA PREDICHA
+    % PREDICTED MEAN
     %% ================================================================
 
-    x_pred = zeros(L,1);
+    x_pred = 0;
 
     for i = 1:2*L+1
 
@@ -211,14 +310,14 @@ for k = 2:N
     end
 
     %% ================================================================
-    % COVARIANZA PREDICHA
+    % PREDICTED COVARIANCE
     %% ================================================================
 
-    P_pred = zeros(L);
+    P_pred = 0;
 
     for i = 1:2*L+1
 
-        diff = Xsigma_pred(:,i)-x_pred;
+        diff = Xsigma_pred(:,i) - x_pred;
 
         P_pred = P_pred + Wc(i)*(diff*diff');
 
@@ -227,7 +326,7 @@ for k = 2:N
     P_pred = P_pred + Q_ukf;
 
     %% ================================================================
-    % MODELO MEDICIÓN
+    % MEASUREMENT MODEL
     %% ================================================================
 
     Ysigma = zeros(1,2*L+1);
@@ -236,25 +335,37 @@ for k = 2:N
 
         SOC_i = Xsigma_pred(1,i);
 
-        Vrc_i = Xsigma_pred(2,i);
+        %% ============================================================
+        % OCV MODEL
+        %% ============================================================
 
-        %% VOC
+        Voc_k = 16.4800*(SOC_i.^3) ...
+              - 35.0493*(SOC_i.^2) ...
+              + 27.6924*(SOC_i) ...
+              + 2.8081;
 
-        Voc = 16.4800*(SOC_i.^3) ...
-            - 35.0493*(SOC_i.^2) ...
-            + 27.6924*(SOC_i) ...
-            + 2.8081;
+        SOC_prev = SOC_ukf(max(k-1,1));
 
-        %% Voltaje terminal
+        Voc_km1 = 16.4800*(SOC_prev.^3) ...
+                - 35.0493*(SOC_prev.^2) ...
+                + 27.6924*(SOC_prev) ...
+                + 2.8081;
 
-        Ysigma(i) = Voc ...
-                  - Rint*I_meas(k) ...
-                  - Vrc_i;
+        %% ============================================================
+        % DISCRETE ECM
+        %% ============================================================
+
+        expTerm = exp(-Ts/(R0*C0));
+
+        Ysigma(i) = Voc_k ...
+                  + (V_exp(k-1)-Voc_km1)*expTerm ...
+                  - (R0-(R0+Rint)*expTerm)*I_corr(k-1) ...
+                  - Rint*I_corr(k);
 
     end
 
     %% ================================================================
-    % MEDIA MEDICIÓN
+    % PREDICTED MEASUREMENT
     %% ================================================================
 
     y_pred = 0;
@@ -266,198 +377,263 @@ for k = 2:N
     end
 
     %% ================================================================
-    % COVARIANZA INNOVACIÓN
+    % INNOVATION COVARIANCE
     %% ================================================================
 
     Pyy = 0;
 
     for i = 1:2*L+1
 
-        diff = Ysigma(i)-y_pred;
+        diff = Ysigma(i) - y_pred;
 
-        Pyy = Pyy + Wc(i)*diff*diff';
+        Pyy = Pyy + Wc(i)*(diff*diff');
 
     end
 
     Pyy = Pyy + R_ukf;
 
     %% ================================================================
-    % COVARIANZA CRUZADA
+    % CROSS COVARIANCE
     %% ================================================================
 
-    Pxy = zeros(L,1);
+    Pxy = 0;
 
     for i = 1:2*L+1
 
-        dx = Xsigma_pred(:,i)-x_pred;
+        dx = Xsigma_pred(:,i) - x_pred;
 
-        dy = Ysigma(i)-y_pred;
+        dy = Ysigma(i) - y_pred;
 
-        Pxy = Pxy + Wc(i)*dx*dy;
+        Pxy = Pxy + Wc(i)*(dx*dy);
 
     end
 
     %% ================================================================
-    % GANANCIA KALMAN
+    % KALMAN GAIN
     %% ================================================================
 
-    K = Pxy/Pyy;
+    K = Pxy / Pyy;
 
     %% ================================================================
-    % ACTUALIZACIÓN
+    % UPDATE
     %% ================================================================
 
-    x_est(:,k) = x_pred ...
-               + K*(V_meas(k)-y_pred);
+    x_update = x_pred ...
+             + K * (V_exp(k) - y_pred);
 
-    %% Limitar SOC
+    x_update = max(0.01,min(0.99,x_update));
 
-    x_est(1,k) = min(0.99,max(0.01,x_est(1,k)));
+    %% ================================================================
+    % SAVE STATES
+    %% ================================================================
 
-    P = P_pred - K*Pyy*K';
+    x_est(:,k) = x_update;
 
-    SOC_ukf(k) = x_est(1,k);
+    P = P_pred - K * Pyy * K';
+
+    SOC_ukf(k) = x_est(:,k);
+
+    V_est(k) = y_pred;
 
 end
 
 %% ========================================================================
-% ERRORES
+% ERROR ANALYSIS USING REFERENCE POINTS
 %% ========================================================================
 
-error_cc  = SOC_real - SOC_cc;
+SOC_ref_valid = SOC_ref(rest_points);
 
-error_ukf = SOC_real - SOC_ukf;
+SOC_cc_valid = SOC_cc(rest_points);
 
-RMSE_cc = sqrt(mean(error_cc.^2));
+SOC_ukf_valid = SOC_ukf(rest_points);
 
-RMSE_ukf = sqrt(mean(error_ukf.^2));
+%% ========================================================================
+% RMSE
+%% ========================================================================
+
+RMSE_CC = ...
+sqrt(mean((SOC_cc_valid - SOC_ref_valid).^2));
+
+RMSE_UKF = ...
+sqrt(mean((SOC_ukf_valid - SOC_ref_valid).^2));
+
+%% ========================================================================
+% MAE
+%% ========================================================================
+
+MAE_CC = ...
+mean(abs(SOC_cc_valid - SOC_ref_valid));
+
+MAE_UKF = ...
+mean(abs(SOC_ukf_valid - SOC_ref_valid));
+
+%% ========================================================================
+% VOLTAGE RMSE
+%% ========================================================================
+
+RMSE_voltage = ...
+sqrt(mean((V_exp - V_est).^2));
 
 fprintf('\n=================================================\n');
-fprintf('RESULTADOS GEMELO DIGITAL\n');
+fprintf('ESTIMATION RESULTS\n');
 fprintf('=================================================\n');
 
-fprintf('RMSE Coulomb Counting = %.6f\n', RMSE_cc);
+fprintf('RMSE Coulomb Counting = %.6f\n', RMSE_CC);
 
-fprintf('RMSE UKF              = %.6f\n', RMSE_ukf);
+fprintf('RMSE UKF + CC         = %.6f\n', RMSE_UKF);
+
+fprintf('\n');
+
+fprintf('MAE Coulomb Counting  = %.6f\n', MAE_CC);
+
+fprintf('MAE UKF + CC          = %.6f\n', MAE_UKF);
+
+fprintf('\n');
+
+fprintf('Voltage RMSE          = %.6f V\n', RMSE_voltage);
 
 %% ========================================================================
-% SOC
+% CONVERGENCE ANALYSIS
+%% ========================================================================
+
+error_ukf = abs(SOC_ukf_valid - SOC_ref_valid);
+
+threshold = 0.02;
+
+window_samples = 5;
+
+convergence_time = NaN;
+
+for k = 1:length(error_ukf)-window_samples
+
+    window_error = error_ukf(k:k+window_samples);
+
+    if all(window_error < threshold)
+
+        convergence_time = t_sec(rest_points(k));
+
+        break;
+
+    end
+
+end
+
+overshoot = max(error_ukf)*100;
+
+fprintf('\n=================================================\n');
+fprintf('CONVERGENCE ANALYSIS\n');
+fprintf('=================================================\n');
+
+fprintf('Maximum Overshoot = %.2f %%\n', overshoot);
+
+fprintf('Convergence Time  = %.2f s\n', convergence_time);
+
+%% ========================================================================
+% SOC COMPARISON
 %% ========================================================================
 
 figure('Color','w')
-
-plot(t_sec/3600,...
-     SOC_real*100,...
-     'LineWidth',2)
-
-hold on
 
 plot(t_sec/3600,...
      SOC_cc*100,...
      '--',...
      'LineWidth',2)
 
+hold on
+
 plot(t_sec/3600,...
      SOC_ukf*100,...
      'LineWidth',2)
 
+plot(t_sec(rest_points)/3600,...
+     SOC_ref(rest_points)*100,...
+     'ko',...
+     'MarkerFaceColor','g',...
+     'MarkerSize',7)
+
 xlabel('Time [h]')
+
 ylabel('SOC [%]')
 
-title('Digital Twin - SOC')
+title('SOC Estimation Comparison')
 
-legend('Real SOC',...
-       'Coulomb Counting',...
-       'UKF')
+legend('Coulomb Counting',...
+       'UKF + CC',...
+       'SOC Reference (Rest Periods)',...
+       'Location','best')
 
 grid on
 
 %% ========================================================================
-% ERROR
+% ERROR COMPARISON
 %% ========================================================================
 
 figure('Color','w')
 
-plot(t_sec/3600,...
-     error_cc*100,...
+plot(t_sec(rest_points)/3600,...
+     abs(SOC_cc_valid - SOC_ref_valid)*100,...
      '--',...
-     'LineWidth',1.5)
+     'LineWidth',2)
 
 hold on
 
-plot(t_sec/3600,...
-     error_ukf*100,...
-     'LineWidth',1.5)
+plot(t_sec(rest_points)/3600,...
+     abs(SOC_ukf_valid - SOC_ref_valid)*100,...
+     'LineWidth',2)
 
 xlabel('Time [h]')
-ylabel('Error [%]')
 
-title('Error Estimación SOC')
+ylabel('Absolute Error [%]')
 
-legend('Error CC','Error UKF')
+title('SOC Estimation Error at Reference Points')
+
+legend('CC Error',...
+       'UKF + CC Error',...
+       'Location','best')
 
 grid on
 
 %% ========================================================================
-% VOLTAJE
+% VOLTAGE COMPARISON
 %% ========================================================================
 
 figure('Color','w')
 
 plot(t_sec/3600,...
-     V_true,...
+     V_exp,...
      'LineWidth',1.5)
 
 hold on
 
 plot(t_sec/3600,...
-     V_meas,...
-     '.')
+     V_est,...
+     '--',...
+     'LineWidth',1.8)
 
 xlabel('Time [h]')
+
 ylabel('Voltage [V]')
 
-title('Digital Twin Voltage')
+title('Experimental vs Estimated Voltage')
 
-legend('Real','Measured')
-
-grid on
-
-%% ========================================================================
-% CORRIENTE
-%% ========================================================================
-
-figure('Color','w')
-
-plot(t_sec/3600,...
-     I_true,...
-     'LineWidth',1.5)
-
-hold on
-
-plot(t_sec/3600,...
-     I_meas,...
-     '.')
-
-xlabel('Tiempo [h]')
-ylabel('Corriente [A]')
-
-title('Corriente Gemelo Digital')
-
-legend('Real','Medida')
+legend('Experimental Voltage',...
+       'UKF Estimated Voltage',...
+       'Location','best')
 
 grid on
 
 %% ========================================================================
-% GUARDAR
+% SAVE RESULTS
 %% ========================================================================
 
-save('UKF_DigitalTwin.mat',...
-     'SOC_real',...
-     'SOC_cc',...
-     'SOC_ukf',...
-     'error_cc',...
-     'error_ukf',...
-     't_sec');
+% save('UKF_Experimental_Results.mat',...
+%      'SOC_ref',...
+%      'SOC_cc',...
+%      'SOC_ukf',...
+%      'V_est',...
+%      'RMSE_CC',...
+%      'RMSE_UKF',...
+%      'RMSE_voltage',...
+%      't_sec');
 
-fprintf('\n✔ UKF sobre gemelo digital guardado\n');
+fprintf('\nâœ” Experimental validation completed successfully\n');
