@@ -1,8 +1,8 @@
 clear; clc; close all;
 
 %% ========================================================================
-%        COULOMB COUNTING vs UKF + CC
-%     ECM THEVENIN 1RC - DATOS EXPERIMENTALES
+%      COULOMB COUNTING vs UKF + CC
+%      ECM THEVENIN 1RC - VALIDACION EXPERIMENTAL
 % ========================================================================
 
 %% ========================================================================
@@ -44,6 +44,10 @@ else
 
 end
 
+Ts = mean(diff(t_sec));
+
+fprintf('Sampling time Ts = %.4f s\n', Ts);
+
 %% ========================================================================
 % EXPERIMENTAL SIGNALS
 %% ========================================================================
@@ -60,13 +64,10 @@ N = length(I_raw);
 
 current_offset = 0.02;
 
-% Corriente positiva durante descarga
+% Positive current during discharge
 I_corr = -(I_raw + current_offset);
 
-% =====================================================
-% DEADZONE DE CORRIENTE
-% =====================================================
-
+% Deadzone
 I_corr(abs(I_corr) < 0.08) = 0;
 
 fprintf('\n=================================================\n');
@@ -74,6 +75,7 @@ fprintf('CURRENT INFORMATION\n');
 fprintf('=================================================\n');
 
 fprintf('Raw current mean       = %.6f A\n', mean(I_raw));
+
 fprintf('Corrected current mean = %.6f A\n', mean(I_corr));
 
 %% ========================================================================
@@ -87,43 +89,21 @@ eta = 1;
 Qn = Cn * 3600;
 
 %% ========================================================================
-% SAMPLING TIME
+% SOC REFERENCE (GROUND TRUTH)
 %% ========================================================================
 
-Ts = mean(diff(t_sec));
+SOC_ref_full = zeros(N,1);
 
-fprintf('Sampling time Ts = %.4f s\n', Ts);
-
-%% ========================================================================
-% SOC REAL (CONTEO DE CORRIENTE EXPERIMENTAL)
-%% ========================================================================
-
-I_real = -I_raw;
-
-I_real(abs(I_real) < 0.08) = 0;
-
-SOC_real = zeros(N,1);
-
-SOC_real(1) = 0.98;
+SOC_ref_full(1) = 1.0;
 
 for k = 2:N
 
-    SOC_real(k) = SOC_real(k-1) ...
-                - (eta*Ts/Qn)*I_real(k);
+    SOC_ref_full(k) = SOC_ref_full(k-1) ...
+                    - (eta * Ts / Qn) * I_corr(k);
 
-    SOC_real(k) = max(0.01,min(0.99,SOC_real(k)));
+    SOC_ref_full(k) = max(0.01,min(0.99,SOC_ref_full(k)));
 
 end
-
-%% ========================================================================
-% ECM PARAMETERS - DESCARGA
-%% ========================================================================
-
-Rint = 0.50523032;
-
-R0   = 0.55510210;
-
-C0   = 5380.22;
 
 %% ========================================================================
 % COULOMB COUNTING
@@ -131,16 +111,82 @@ C0   = 5380.22;
 
 SOC_cc = zeros(N,1);
 
-SOC_cc(1) = SOC_real(1);
+SOC_cc(1) = 1.0;
 
 for k = 2:N
 
     SOC_cc(k) = SOC_cc(k-1) ...
               - (eta * Ts / Qn) * I_corr(k);
 
-    SOC_cc(k) = max(0.01, min(0.99, SOC_cc(k)));
+    SOC_cc(k) = max(0.01,min(0.99,SOC_cc(k)));
 
 end
+
+%% ========================================================================
+% DETECTION OF REST PERIODS
+%% ========================================================================
+
+rest_threshold = 0.05;
+
+min_rest_time = 60;
+
+min_rest_samples = round(min_rest_time/Ts);
+
+rest_logic = abs(I_corr) < rest_threshold;
+
+SOC_ref = nan(N,1);
+
+rest_points = [];
+
+k = 1;
+
+while k < N
+
+    if rest_logic(k)
+
+        start_idx = k;
+
+        while k < N && rest_logic(k)
+
+            k = k + 1;
+
+        end
+
+        end_idx = k - 1;
+
+        duration = end_idx - start_idx + 1;
+
+        if duration >= min_rest_samples
+
+            ref_idx = end_idx;
+
+            rest_points = [rest_points; ref_idx];
+
+            SOC_ref(ref_idx) = SOC_ref_full(ref_idx);
+
+        end
+
+    end
+
+    k = k + 1;
+
+end
+
+fprintf('\n=================================================\n');
+fprintf('REST PERIODS DETECTED\n');
+fprintf('=================================================\n');
+
+fprintf('Number of reference points = %d\n', length(rest_points));
+
+%% ========================================================================
+% ECM PARAMETERS
+%% ========================================================================
+
+Rint = 0.50523032;
+
+R0   = 0.55510210;
+
+C0   = 5380.22;
 
 %% ========================================================================
 % UKF CONFIGURATION
@@ -184,7 +230,7 @@ end
 
 Q_ukf = 1e-8;
 
-R_ukf = 0.9^2;
+R_ukf = 0.15^2;
 
 %% ========================================================================
 % INITIALIZATION
@@ -245,7 +291,7 @@ for k = 2:N
         SOC_pred = SOC_i ...
                  - (eta * Ts / Qn) * I_corr(k);
 
-        SOC_pred = max(0.01, min(0.99, SOC_pred));
+        SOC_pred = max(0.01,min(0.99,SOC_pred));
 
         Xsigma_pred(:,i) = SOC_pred;
 
@@ -259,7 +305,7 @@ for k = 2:N
 
     for i = 1:2*L+1
 
-        x_pred = x_pred + Wm(i) * Xsigma_pred(:,i);
+        x_pred = x_pred + Wm(i)*Xsigma_pred(:,i);
 
     end
 
@@ -273,7 +319,7 @@ for k = 2:N
 
         diff = Xsigma_pred(:,i) - x_pred;
 
-        P_pred = P_pred + Wc(i) * (diff * diff');
+        P_pred = P_pred + Wc(i)*(diff*diff');
 
     end
 
@@ -290,17 +336,13 @@ for k = 2:N
         SOC_i = Xsigma_pred(1,i);
 
         %% ============================================================
-        % VOC ACTUAL
+        % OCV MODEL
         %% ============================================================
 
         Voc_k = 16.4800*(SOC_i.^3) ...
               - 35.0493*(SOC_i.^2) ...
               + 27.6924*(SOC_i) ...
               + 2.8081;
-
-        %% ============================================================
-        % VOC PREVIO
-        %% ============================================================
 
         SOC_prev = SOC_ukf(max(k-1,1));
 
@@ -310,14 +352,14 @@ for k = 2:N
                 + 2.8081;
 
         %% ============================================================
-        % THEVENIN 1RC DISCRETO
+        % DISCRETE ECM
         %% ============================================================
 
         expTerm = exp(-Ts/(R0*C0));
 
         Ysigma(i) = Voc_k ...
-                  + (V_exp(k-1) - Voc_km1)*expTerm ...
-                  - (R0 - (R0 + Rint)*expTerm)*I_corr(k-1) ...
+                  + (V_exp(k-1)-Voc_km1)*expTerm ...
+                  - (R0-(R0+Rint)*expTerm)*I_corr(k-1) ...
                   - Rint*I_corr(k);
 
     end
@@ -379,11 +421,7 @@ for k = 2:N
     x_update = x_pred ...
              + K * (V_exp(k) - y_pred);
 
-    %% ================================================================
-    % SOC LIMITS
-    %% ================================================================
-
-    x_update = max(0.01, min(0.99, x_update));
+    x_update = max(0.01,min(0.99,x_update));
 
     %% ================================================================
     % SAVE STATES
@@ -400,14 +438,38 @@ for k = 2:N
 end
 
 %% ========================================================================
+% ERROR ANALYSIS USING REFERENCE POINTS
+%% ========================================================================
+
+SOC_ref_valid = SOC_ref(rest_points);
+
+SOC_cc_valid = SOC_cc(rest_points);
+
+SOC_ukf_valid = SOC_ukf(rest_points);
+
+%% ========================================================================
 % RMSE
 %% ========================================================================
 
 RMSE_CC = ...
-sqrt(mean((SOC_cc - SOC_real).^2));
+sqrt(mean((SOC_cc_valid - SOC_ref_valid).^2));
 
 RMSE_UKF = ...
-sqrt(mean((SOC_ukf - SOC_real).^2));
+sqrt(mean((SOC_ukf_valid - SOC_ref_valid).^2));
+
+%% ========================================================================
+% MAE
+%% ========================================================================
+
+MAE_CC = ...
+mean(abs(SOC_cc_valid - SOC_ref_valid));
+
+MAE_UKF = ...
+mean(abs(SOC_ukf_valid - SOC_ref_valid));
+
+%% ========================================================================
+% VOLTAGE RMSE
+%% ========================================================================
 
 RMSE_voltage = ...
 sqrt(mean((V_exp - V_est).^2));
@@ -420,7 +482,51 @@ fprintf('RMSE Coulomb Counting = %.6f\n', RMSE_CC);
 
 fprintf('RMSE UKF + CC         = %.6f\n', RMSE_UKF);
 
+fprintf('\n');
+
+fprintf('MAE Coulomb Counting  = %.6f\n', MAE_CC);
+
+fprintf('MAE UKF + CC          = %.6f\n', MAE_UKF);
+
+fprintf('\n');
+
 fprintf('Voltage RMSE          = %.6f V\n', RMSE_voltage);
+
+%% ========================================================================
+% CONVERGENCE ANALYSIS
+%% ========================================================================
+
+error_ukf = abs(SOC_ukf_valid - SOC_ref_valid);
+
+threshold = 0.02;
+
+window_samples = 5;
+
+convergence_time = NaN;
+
+for k = 1:length(error_ukf)-window_samples
+
+    window_error = error_ukf(k:k+window_samples);
+
+    if all(window_error < threshold)
+
+        convergence_time = t_sec(rest_points(k));
+
+        break;
+
+    end
+
+end
+
+overshoot = max(error_ukf)*100;
+
+fprintf('\n=================================================\n');
+fprintf('CONVERGENCE ANALYSIS\n');
+fprintf('=================================================\n');
+
+fprintf('Maximum Overshoot = %.2f %%\n', overshoot);
+
+fprintf('Convergence Time  = %.2f s\n', convergence_time);
 
 %% ========================================================================
 % SOC COMPARISON
@@ -429,20 +535,21 @@ fprintf('Voltage RMSE          = %.6f V\n', RMSE_voltage);
 figure('Color','w')
 
 plot(t_sec/3600,...
-     SOC_real*100,...
-     'k',...
+     SOC_cc*100,...
+     '--',...
      'LineWidth',2)
 
 hold on
 
 plot(t_sec/3600,...
-     SOC_cc*100,...
-     '--',...
-     'LineWidth',2)
-
-plot(t_sec/3600,...
      SOC_ukf*100,...
      'LineWidth',2)
+
+plot(t_sec(rest_points)/3600,...
+     SOC_ref(rest_points)*100,...
+     'ko',...
+     'MarkerFaceColor','g',...
+     'MarkerSize',7)
 
 xlabel('Time [h]')
 
@@ -450,9 +557,38 @@ ylabel('SOC [%]')
 
 title('SOC Estimation Comparison')
 
-legend('SOC Real',...
-       'Coulomb Counting',...
+legend('Coulomb Counting',...
        'UKF + CC',...
+       'SOC Reference (Rest Periods)',...
+       'Location','best')
+
+grid on
+
+%% ========================================================================
+% ERROR COMPARISON
+%% ========================================================================
+
+figure('Color','w')
+
+plot(t_sec(rest_points)/3600,...
+     abs(SOC_cc_valid - SOC_ref_valid)*100,...
+     '--',...
+     'LineWidth',2)
+
+hold on
+
+plot(t_sec(rest_points)/3600,...
+     abs(SOC_ukf_valid - SOC_ref_valid)*100,...
+     'LineWidth',2)
+
+xlabel('Time [h]')
+
+ylabel('Absolute Error [%]')
+
+title('SOC Estimation Error at Reference Points')
+
+legend('CC Error',...
+       'UKF + CC Error',...
        'Location','best')
 
 grid on
@@ -478,7 +614,7 @@ xlabel('Time [h]')
 
 ylabel('Voltage [V]')
 
-title('Experimental vs UKF Estimated Voltage')
+title('Experimental vs Estimated Voltage')
 
 legend('Experimental Voltage',...
        'UKF Estimated Voltage',...
@@ -487,46 +623,17 @@ legend('Experimental Voltage',...
 grid on
 
 %% ========================================================================
-% CURRENT
-%% ========================================================================
-
-figure('Color','w')
-
-plot(t_sec/3600,...
-     I_raw,...
-     ':',...
-     'LineWidth',1.2)
-
-hold on
-
-plot(t_sec/3600,...
-     I_corr,...
-     'LineWidth',1.5)
-
-xlabel('Time [h]')
-
-ylabel('Current [A]')
-
-title('Raw vs Corrected Current')
-
-legend('Raw Current',...
-       'Corrected Current',...
-       'Location','best')
-
-grid on
-
-%% ========================================================================
 % SAVE RESULTS
 %% ========================================================================
 
-save('UKF_Experimental_Results_FIXED.mat',...
-     'SOC_real',...
-     'SOC_cc',...
-     'SOC_ukf',...
-     'V_est',...
-     'RMSE_CC',...
-     'RMSE_UKF',...
-     'RMSE_voltage',...
-     't_sec');
+% save('UKF_Experimental_Results.mat',...
+%      'SOC_ref',...
+%      'SOC_cc',...
+%      'SOC_ukf',...
+%      'V_est',...
+%      'RMSE_CC',...
+%      'RMSE_UKF',...
+%      'RMSE_voltage',...
+%      't_sec');
 
-fprintf('\n✔ Corrected UKF results saved successfully\n');
+fprintf('\nâœ” Experimental validation completed successfully\n');
